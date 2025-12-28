@@ -1,3 +1,4 @@
+# 強制更新給我看 - 20251229
 import streamlit as st
 import pandas as pd
 import yfinance as yf
