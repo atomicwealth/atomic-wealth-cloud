@@ -177,6 +177,12 @@ else:
                     "price": price,
                     "notes": notes if notes else None
                 }
+                # 👇👇👇 [🔍 吐真劑] 加入這一行來檢查資料！ 👇👇👇
+                st.write("正在傳送的資料包 (Debug):", new_data)
+
+                try:
+                    with st.spinner("正在寫入區塊鏈..."):
+                        # ... (後面的程式碼)    
                     try:
                         with st.spinner("正在寫入區塊鏈..."):
                             supabase.table("transactions").insert(new_data).execute()
