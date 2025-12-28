@@ -1,3 +1,4 @@
+# 強制更新 v8.0 - 20251228
 import streamlit as st
 import pandas as pd
 import yfinance as yf
