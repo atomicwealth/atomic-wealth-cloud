@@ -120,8 +120,12 @@ else:
                 if not ticker or amount <= 0 or price <= 0:
                     st.error("資料不完整。")
                 else:
-                    # [標準版] 讓 Supabase 自動填寫 user_id
+                   # [🔥🔥🔥 強制手動加入 user_id 🔥🔥🔥]
+                    # 我們不再信任資料庫的自動填寫功能，直接在程式碼裡把 ID 塞進去
+                    current_user_id = st.session_state['user'].id
+
                     new_data = {
+                        "user_id": current_user_id, # <--- 關鍵！明確告訴資料庫這是誰的資料
                         "date": str(date),
                         "ticker": ticker,
                         "type": trans_type,
@@ -130,6 +134,9 @@ else:
                         "amount": amount,
                         "price": price
                     }
+                    
+                    # [🔍 除錯用] 把要傳送的資料印在網頁上給我們看，證明 ID 有在裡面
+                    st.write("準備寫入資料庫的 Payload:", new_data)
                     try:
                         with st.spinner("正在寫入..."):
                             supabase.table("transactions").insert(new_data).execute()
