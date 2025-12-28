@@ -124,7 +124,12 @@ def get_stock_info(ticker_symbol):
         if ttm_dividend == 0 and current_price > 0:
              info = stock.info
              ttm_dividend = info.get('dividendRate', 0)
-             if ttm_dividend is None or ttm_dividend == 0: div_yield = info.get('dividendYield', 0); if div_yield is not None and div_yield > 0: ttm_dividend = current_price * div_yield
+             # 找到原本那行，把它改成下面這樣：
+        if ttm_dividend is None or ttm_dividend == 0:
+            div_yield = info.get('dividendYield', 0)
+            # 關鍵在這裡：這裡要換行，並且要縮排！
+            if div_yield is not None and div_yield > 0:
+                ttm_dividend = current_price * div_yield
         return current_price, ttm_dividend if ttm_dividend is not None else 0
     except: return None, 0
 
