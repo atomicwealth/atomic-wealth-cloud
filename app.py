@@ -218,15 +218,26 @@ else:
         # 批量獲取現價
         current_prices = get_current_prices(unique_tickers)
 
-        # 計算每一筆交易的目前價值
+       # 計算每一筆交易的目前價值 (修復版)
         def calculate_current_value(row):
             ticker = row['ticker']
             price = current_prices.get(ticker)
+            
+            # 先檢查價格是否有效
             if price is None or pd.isna(price):
-                return None # 抓不到價格就不算
-            market_value_original = row['amount'] * price
-            # 轉換回台幣
-            return market_value_original * (usdtwd_rate if row['currency'] == 'USD' else 1)
+                return None 
+
+            try:
+                # === 關鍵修改：強制轉換成浮點數 (float) 再相乘 ===
+                amount_val = float(row['amount'])
+                price_val = float(price)
+                market_value_original = amount_val * price_val
+                
+                # 轉換回台幣
+                return market_value_original * (usdtwd_rate if row['currency'] == 'USD' else 1)
+            except (ValueError, TypeError):
+                # 如果真的遇到無法轉換的資料，回傳 None 避免整個網頁崩潰
+                return None
 
         df['market_value_twd'] = df.apply(calculate_current_value, axis=1)
         
