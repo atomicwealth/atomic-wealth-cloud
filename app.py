@@ -163,17 +163,20 @@ else:
                     st.error("請輸入正確的代號、數量和價格。")
                 else:
                     # 準備要寫入的資料字典
-                    # 注意：我們不需要手動加入 user_id，Supabase RLS 會自動處理！
-                    new_data = {
-                        "date": str(date),
-                        "ticker": ticker,
-                        "type": trans_type,
-                        "currency": currency,
-                        "asset_type": asset_type.split(" ")[0],
-                        "amount": amount,
-                        "price": price,
-                        "notes": notes if notes else None
-                    }
+                # [🔥🔥🔥 終極修改 🔥🔥🔥] 手動強制加入 user_id，繞過資料庫自動填寫的 bug
+                current_user_id = st.session_state['user'].id
+
+                new_data = {
+                    "user_id": current_user_id,  # <--- 關鍵就是加了這一行！
+                    "date": str(date),
+                    "ticker": ticker,
+                    "type": trans_type,
+                    "currency": currency,
+                    "asset_type": asset_type.split(" ")[0],
+                    "amount": amount,
+                    "price": price,
+                    "notes": notes if notes else None
+                }
                     try:
                         with st.spinner("正在寫入區塊鏈..."):
                             supabase.table("transactions").insert(new_data).execute()
