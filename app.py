@@ -1,295 +1,305 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+from datetime import datetime
+import time
 import plotly.express as px
 from supabase import create_client, Client
-import time
 
-# --- 1. 頁面基礎設定 ---
+# ==========================================
+# 1. 雲端資料庫連線與設定
+# ==========================================
 st.set_page_config(page_title="原子存股 (雲端版)", page_icon="⚛️", layout="wide")
 
-# --- 2. 初始化 Supabase 連線 ---
-@st.cache_resource
-def init_connection():
+try:
+    SUPABASE_URL = st.secrets["supabase"]["url"]
+    SUPABASE_KEY = st.secrets["supabase"]["key"]
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    st.error(f"❌ 雲端連線失敗: {e}")
+    st.stop()
+
+# ==========================================
+# 讀取資料函式 (確保型態正確)
+# ==========================================
+def load_data_from_cloud():
     try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
+        response = supabase.table("transactions").select("*").execute()
+        data = response.data
+        if not data: return pd.DataFrame(columns=["Date", "Ticker", "Type", "AssetType", "Shares", "Price", "Currency", "Note"])
+        df = pd.DataFrame(data)
+        
+        # 強制轉換型態
+        df['Shares'] = pd.to_numeric(df['Shares'], errors='coerce').fillna(0)
+        df['Price'] = pd.to_numeric(df['Price'], errors='coerce').fillna(0)
+        df['Date'] = df['Date'].astype(str)
+        if 'Type' in df.columns:
+             df['Type'] = df['Type'].astype(str).apply(lambda x: x.split(" ")[0] if isinstance(x, str) and " " in x else x).str.strip()
+        
+        return df
     except Exception as e:
-        st.error(f"Supabase 連線失敗，請檢查 Secrets 設定。錯誤: {e}")
-        st.stop()
+        st.error(f"☁️ 讀取雲端資料失敗: {e}")
+        return pd.DataFrame()
 
-supabase: Client = init_connection()
-
-# --- 3. 全域變數與輔助函式 ---
-if 'user' not in st.session_state:
-    st.session_state['user'] = None
-
-# 取得即時匯率 (快取 1 小時)
+# ==========================================
+# 2. 核心運算邏輯 (已修正累加位置)
+# ==========================================
 @st.cache_data(ttl=3600)
 def get_usdtwd_rate():
     try:
-        usdtwd = yf.Ticker("TWD=X")
-        history = usdtwd.history(period="1d")
-        if not history.empty:
-            return history['Close'].iloc[-1]
-        return 31.0
-    except:
-        return 31.0
+        return yf.Ticker("TWD=X").history(period="1d")['Close'].iloc[-1]
+    except: return 32.5
 
-usdtwd_rate = get_usdtwd_rate()
-
-# 批量獲取目前股價 (快取 10 分鐘)
-@st.cache_data(ttl=600)
-def get_current_prices(tickers):
-    if not tickers: return {}
+def try_fetch_price(ticker_symbol):
     try:
-        tickers_str = " ".join(tickers)
-        # 使用 yf.download 批量獲取
-        data = yf.download(tickers_str, period="1d", group_by='ticker')
-        prices = {}
-        for ticker in tickers:
-            try:
-                if len(tickers) == 1:
-                    # 如果只有一支股票，資料結構不同
-                    price = data['Close'].iloc[-1]
-                else:
-                    price = data[ticker]['Close'].iloc[-1]
-                prices[ticker] = price
-            except Exception:
-                 # 抓不到就填 None
-                prices[ticker] = None
-        return prices
-    except Exception as e:
-        st.warning(f"股價獲取部分失敗: {e}")
-        return {}
+        ticker = yf.Ticker(ticker_symbol)
+        price = ticker.fast_info.get('last_price')
+        if price is not None and price > 0: return price
+        time.sleep(0.1) 
+        hist = ticker.history(period="1d")
+        if not hist.empty and hist['Close'].iloc[-1] > 0: return hist['Close'].iloc[-1]
+        return None
+    except: return None
 
-# --- 4. 登入/註冊介面函式 ---
-def login_form():
-    st.header("🔐 會員登入 / 註冊")
-    tab1, tab2 = st.tabs(["登入", "註冊新帳號"])
+@st.cache_data(ttl=1800)
+def get_stock_info(ticker_symbol):
+    try:
+        stock = yf.Ticker(ticker_symbol)
+        current_price = stock.fast_info.get('last_price')
+        if current_price is None:
+             info = stock.info
+             current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+        if current_price is None: return None, 0
+
+        ttm_dividend = 0
+        try:
+            dividends = stock.dividends
+            if not dividends.empty:
+                now = pd.Timestamp.now(tz=dividends.index.tz)
+                one_year_ago = now - pd.DateOffset(months=12)
+                ttm_dividend = dividends[dividends.index > one_year_ago].sum()
+        except: pass
+        
+        if ttm_dividend == 0 and current_price > 0:
+             info = stock.info
+             ttm_dividend = info.get('dividendRate', 0)
+             if ttm_dividend is None or ttm_dividend == 0:
+                 div_yield = info.get('dividendYield', 0)
+                 if div_yield is not None and div_yield > 0:
+                     ttm_dividend = current_price * div_yield
+        return current_price, ttm_dividend if ttm_dividend is not None else 0
+    except: return None, 0
+
+def calculate_portfolio(df, usdtwd_rate):
+    total_market_value_twd = 0
+    total_cost_twd = 0
+    total_annual_dividend_twd = 0
+    total_received_dividend_twd = 0 
+    results = []
     
-    # ... (登入 Tab) ...
-    with tab1:
-        email_in = st.text_input("電子信箱", key="login_email")
-        password_in = st.text_input("密碼", type="password", key="login_pass")
-        if st.button("登入", type="primary"):
-            if not email_in or not password_in:
-                st.warning("請輸入信箱和密碼。")
-            else:
-                try:
-                    with st.spinner("正在驗證身分..."):
-                        response = supabase.auth.sign_in_with_password({"email": email_in, "password": password_in})
-                        st.session_state['user'] = response.user
-                        st.success("登入成功！")
-                        time.sleep(0.5)
-                        st.rerun()
-                except Exception as e:
-                    # 這裡可以捕捉具體的錯誤訊息，例如密碼錯誤
-                    st.error(f"登入失敗: 請檢查帳號密碼。({e})")
+    if not df.empty:
+        if 'AssetType' not in df.columns: df['AssetType'] = 'Stock'
 
-    # ... (註冊 Tab) ...
-    with tab2:
-        email_reg = st.text_input("電子信箱", key="reg_email")
-        password_reg = st.text_input("設定密碼 (至少6位數)", type="password", key="reg_pass")
-        if st.button("註冊"):
-            if not email_reg or len(password_reg) < 6:
-                st.warning("請輸入有效的信箱，密碼需>6位。")
-            else:
-                try:
-                    with st.spinner("正在建立帳號..."):
-                        response = supabase.auth.sign_up({"email": email_reg, "password": password_reg})
-                        # 檢查是否需要信箱驗證
-                        if response.user and response.user.identities and len(response.user.identities) > 0:
-                             st.success("註冊成功！請去信箱收驗證信，驗證後即可登入。")
-                        else:
-                             # 有些 Supabase 設定是註冊後自動登入，或不需要驗證
-                             st.success("註冊成功！請切換到「登入」頁籤登入。")
-                except Exception as e:
-                    st.error(f"註冊失敗: {e}")
-
-# === 主程式邏輯 ===
-if st.session_state['user'] is None:
-    # 如果沒登入，顯示登入表單
-    login_form()
-else:
-    # 已登入，顯示主畫面
-    user_email = st.session_state['user'].email
-
-    # --- B1. 側邊欄 (輸入資料) ---
-    with st.sidebar:
-        st.write(f"👤 **{user_email}**")
-        if st.button("登出", type="secondary"):
-            supabase.auth.sign_out()
-            st.session_state['user'] = None
-            st.rerun()
-        
-        st.divider()
-        st.header("➕ 新增交易")
-        
-        # 使用 form 來包裹輸入項，避免每次輸入都重新整理
-        with st.form("add_trans", clear_on_submit=True):
-            date = st.date_input("日期")
-            ticker = st.text_input("代號 (例如: 2330.TW, AAPL)").upper().strip()
-            col1, col2 = st.columns(2)
-            with col1:
-                trans_type = st.selectbox("類別", ["Buy", "Sell"])
-                currency = st.selectbox("幣別", ["TWD", "USD"])
-            with col2:
-                asset_type = st.selectbox("資產", ["Stock", "ETF", "Crypto"])
-                
-            amount = st.number_input("數量 (股/顆)", min_value=0.0001, format="%.4f")
-            price = st.number_input("單價", min_value=0.0001, format="%.2f")
-            notes = st.text_area("備註 (選填)")
-
-            submitted = st.form_submit_button("🚀 確認注入", type="primary")
+        dividend_transactions = df[df['Type'] == "DIVIDEND"]
+        for _, row in dividend_transactions.iterrows():
+            price_val = row['Price'] if pd.notnull(row['Price']) else 0
+            fx_rate = usdtwd_rate if row['Currency'] == 'USD' else 1.0
+            total_received_dividend_twd += price_val * fx_rate
             
-            if submitted:
-                # 基本驗證
-                if not ticker:
-                    st.error("請輸入股票代號。")
-                elif amount <= 0 or price <= 0:
-                    st.error("數量和價格必須大於 0。")
-                else:
-                    # --- 關鍵修改：準備要寫入的資料 ---
-                    # 我們已經重建資料庫，設定好 user_id 會自動填寫。
-                    # 所以這裡只要準備交易資料本身就好，不需要手動加 user_id。
-                    new_data = {
-                        "date": str(date),
-                        "ticker": ticker,
-                        "type": trans_type,
-                        "currency": currency,
-                        "asset_type": asset_type.split(" ")[0], # 只取第一個單字
-                        "amount": amount,
-                        "price": price,
-                        "notes": notes if notes else None # 如果沒寫備註就傳 None
-                    }
-                    
-                    try:
-                        with st.spinner("正在寫入區塊鏈... (誤) 正在寫入資料庫..."):
-                            # 呼叫 Supabase 寫入資料
-                            data, count = supabase.table("transactions").insert(new_data).execute()
-                        
-                        st.toast("✅ 交易成功注入！", icon="🎉")
-                        # 暫停一下讓使用者看到成功訊息
-                        time.sleep(1)
-                        # 重新整理網頁以顯示最新資料
-                        st.rerun()
-                        
-                    except Exception as e:
-                        # 如果失敗，把錯誤訊息印出來，方便除錯
-                        st.error(f"寫入失敗，請截圖給開發者: {e}")
+        grouped = df.groupby('Ticker')
+        for ticker, group_df in grouped:
+            buys = group_df[group_df['Type'] == 'BUY']
+            sells = group_df[group_df['Type'] == 'SELL']
+            total_shares = buys['Shares'].sum() - sells['Shares'].sum()
+            
+            if total_shares <= 0: continue
 
-    # --- B2. 主畫面 (儀表板) ---
-    st.title("⚛️ 原子存股 (雲端版)")
-    st.caption(f"即時匯率參考: 1 USD ≈ {usdtwd_rate:.2f} TWD")
-    
-    # 1. 從 Supabase 讀取目前使用者的資料
-    try:
-        # RLS 政策會確保只撈到自己的資料
-        response = supabase.table("transactions").select("*").order("date", desc=True).execute()
-        df = pd.DataFrame(response.data)
-    except Exception as e:
-        st.error(f"讀取資料失敗: {e}")
-        df = pd.DataFrame() # 發生錯誤時建立空 DataFrame 避免後面崩潰
+            avg_cost = (buys['Price'] * buys['Shares']).sum() / buys['Shares'].sum() if not buys.empty else 0
+            currency = group_df['Currency'].iloc[0]
+            asset_type = group_df['AssetType'].iloc[0]
 
-    # 2. 判斷是否有資料
-    if df.empty:
-        st.info("👋 歡迎！目前還沒有任何交易紀錄。請從左側側邊欄新增您的第一筆投資！")
-        # 可以在這裡放一張空的示意圖或教學
+            current_price, ttm_dividend = get_stock_info(ticker)
+
+            if current_price is None or current_price <= 0:
+                 # 如果抓不到報價，用成本價暫代，避免市值為 0 (可選)
+                 # current_price = avg_cost 
+                 # 或者就讓它是 0，並顯示警告
+                 current_price = 0
+
+            fx_rate = usdtwd_rate if currency == 'USD' else 1.0
+            market_value = current_price * total_shares * fx_rate
+            cost_value = avg_cost * total_shares * fx_rate
+            annual_dividend = ttm_dividend * total_shares * fx_rate
+            unrealized_pl = market_value - cost_value
+            
+            # 🔥🔥🔥 關鍵修正：這三行必須在 for 迴圈裡面 (縮排要正確) 🔥🔥🔥
+            total_market_value_twd += market_value
+            total_cost_twd += cost_value
+            total_annual_dividend_twd += annual_dividend
+            # ---------------------------------------------------------
+            
+            results.append({
+                "代號": ticker, "資產類別": asset_type, "股數": total_shares,
+                "現價": f"{current_price:.2f} ({currency})",
+                "市值(TWD)": market_value, "成本(TWD)": cost_value,
+                "未實現損益": unrealized_pl,
+                "報酬率%": (unrealized_pl / cost_value) if cost_value > 0 else 0,
+                "成本殖利率(YoC)%": (annual_dividend / cost_value) if cost_value > 0 else 0,
+                "預估年息(TWD)": annual_dividend
+            })
+        portfolio_df = pd.DataFrame(results)
     else:
-        # 3. 資料處理與計算
-        # 確保數值欄位是數字型態
-        df['amount'] = pd.to_numeric(df['amount'])
-        df['price'] = pd.to_numeric(df['price'])
+        portfolio_df = pd.DataFrame()
+
+    total_return_numerator = (total_market_value_twd + total_received_dividend_twd) - total_cost_twd
+    metrics = {
+        "total_market_value": total_market_value_twd,
+        "total_cost": total_cost_twd,
+        "total_annual_dividend": total_annual_dividend_twd,
+        "monthly_passive_income": total_annual_dividend_twd / 12,
+        "total_return_pct": (total_return_numerator / total_cost_twd * 100) if total_cost_twd > 0 else 0,
+        "avg_yoc_pct": (total_annual_dividend_twd / total_cost_twd * 100) if total_cost_twd > 0 else 0,
+        "total_received_dividend": total_received_dividend_twd
+    }
+    return metrics, portfolio_df
+
+# ==========================================
+# 3. 介面呈現 (Streamlit UI)
+# ==========================================
+with st.spinner("正在從全球市場獲取最新報價與配息資料..."):
+    df_transactions = load_data_from_cloud()
+    usdtwd_rate = get_usdtwd_rate()
+    metrics, df_portfolio = calculate_portfolio(df_transactions, usdtwd_rate)
+
+# --- 側邊欄 (保持不變) ---
+with st.sidebar:
+    st.header("➕ 注入原子能量 (雲端直連)")
+    with st.form("add_transaction_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        date_input = col1.date_input("日期", datetime.today())
+        ticker_input = col2.text_input("代號", value="").upper().strip()
+        col3, col4 = st.columns(2)
+        trans_type_input = col3.selectbox("交易類別", ["BUY (買入)", "SELL (賣出)", "DIVIDEND (領息)"])
+        trans_type_clean = trans_type_input.split(" ")[0]
+        is_dividend = trans_type_clean == "DIVIDEND"
+        currency = col4.selectbox("幣別", ["TWD", "USD"])
+        asset_type_input = st.selectbox("資產類別", ["Stock (股票/ETF)", "Bond (債券/類現金)"])
+        asset_type_save = "Stock" if "Stock" in asset_type_input else "Bond"
+        shares_label = "股數 (股)" if not is_dividend else "股數 (領息請維持 0)"
+        price_label = "成交單價 (原幣)" if not is_dividend else "領息總金額 (原幣)"
+        col5, col6 = st.columns(2)
+        shares_input = col5.number_input(shares_label, min_value=0.00, step=1.0, format="%.2f")
+        price_input = col6.number_input(price_label, min_value=0.00, step=0.1, format="%.2f")
+        note_input = st.text_input("備註 (選填)")
+        if is_dividend: st.info("💡 領息模式：請在右側「領息總金額」填寫實際收到的金額。")
+        submitted = st.form_submit_button("🚀 確認注入雲端 (Inject to Cloud)")
+        if submitted:
+            if not ticker_input or price_input < 0: st.error("請填寫正確的代號和金額")
+            elif not is_dividend and shares_input <= 0: st.error("買賣交易請填寫正確的股數 (>0)")
+            elif is_dividend and price_input <= 0: st.error("領息交易請填寫正確的總金額 (>0)")
+            else:
+                final_ticker = ticker_input
+                if not is_dividend and currency == "TWD" and "." not in ticker_input:
+                    with st.spinner(f"偵測中: {ticker_input}..."):
+                        if try_fetch_price(ticker_input + ".TW") is not None: final_ticker = ticker_input + ".TW"
+                        elif try_fetch_price(ticker_input + ".TWO") is not None: final_ticker = ticker_input + ".TWO"
+                try:
+                    new_transaction = {"Date": str(date_input),"Ticker": final_ticker,"Type": trans_type_clean,"AssetType": asset_type_save,"Shares": shares_input,"Price": price_input,"Currency": currency,"Note": note_input}
+                    supabase.table("transactions").insert(new_transaction).execute()
+                    st.success(f"✅ 已成功注入雲端資料庫！")
+                    time.sleep(0.5)
+                    st.rerun()
+                except Exception as e: st.error(f"❌ 寫入雲端失敗: {e}")
+
+# --- 主頁面 (保持不變) ---
+st.title("⚛️ 原子存股 (Atomic Wealth) | ☁️ 雲端版")
+st.caption(f"即時匯率參考: 1 USD ≈ {usdtwd_rate:.2f} TWD")
+
+if df_transactions.empty:
+    st.info("👈 雲端資料庫目前是空的。請在左側注入第一筆交易能量！")
+else:
+    # 1. 頂部核心指標
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("💰 總資產現值 (TWD)", f"${metrics['total_market_value']:,.0f}")
+    col_m2.metric("📈 總含息報酬率", f"{metrics['total_return_pct']:+.2f}%", delta=f"{metrics['total_return_pct']:+.2f}%", help="包含帳面損益與歷史已領股息的總報酬")
+    col_m3.metric("💎 總成本殖利率 (YoC)", f"{metrics['avg_yoc_pct']:.2f}%", help="原始投入成本的未來預估股息回報率")
+    col_m4.metric("💵 已領取歷史總股息 (TWD)", f"${metrics['total_received_dividend']:,.0f}", help="歷史上實際已領到口袋的現金股息總額")
+    
+    st.divider()
+
+    # 2. 被動收入層級塔
+    st.header("🗼 被動收入層級塔")
+    monthly_income = metrics['monthly_passive_income']
+    LEVEL_1_GOAL, LEVEL_2_GOAL, LEVEL_3_GOAL = 25000, 60000, 100000
+    st.markdown(f"""<div style="text-align: center;"><h1 style="font-size: 4rem; margin-bottom: 0; color: #00E5FF;">${monthly_income:,.0f}</h1><p style="font-size: 1.2rem; color: gray;">預估平均每月被動收入 (TWD)</p></div>""", unsafe_allow_html=True)
+
+    if monthly_income < LEVEL_1_GOAL:
+        st.write(f"🧱 **Level 1: 生存基石** (${LEVEL_1_GOAL:,.0f}/月)")
+        st.progress(monthly_income / LEVEL_1_GOAL if LEVEL_1_GOAL > 0 else 0)
+    elif monthly_income < LEVEL_2_GOAL:
+        st.write(f"🏠 **Level 2: 薪資替代** (${LEVEL_2_GOAL:,.0f}/月)")
+        st.progress((monthly_income - LEVEL_1_GOAL) / (LEVEL_2_GOAL - LEVEL_1_GOAL) if LEVEL_2_GOAL > LEVEL_1_GOAL else 0)
+    else:
+        st.write(f"🗽 **Level 3: 財富自由** (${LEVEL_3_GOAL:,.0f}/月)")
+        st.progress(min(1.0, (monthly_income - LEVEL_2_GOAL) / (LEVEL_3_GOAL - LEVEL_2_GOAL)) if LEVEL_3_GOAL > LEVEL_2_GOAL else 0)
+        st.balloons()
+
+    st.divider()
+
+    # ==========================================
+    # 🔥 原子結構分析圖表
+    # ==========================================
+    if not df_portfolio.empty:
+        st.header("📊 原子結構分析")
+        col_chart1, col_chart2, col_chart3 = st.columns(3)
+
+        with col_chart1:
+            st.subheader("股債配置 (市值)")
+            df_asset_alloc = df_portfolio.groupby('資產類別')['市值(TWD)'].sum().reset_index()
+            if not df_asset_alloc.empty:
+                fig_asset = px.pie(df_asset_alloc, values='市值(TWD)', names='資產類別', hole=0.4,
+                    color='資產類別', color_discrete_map={'Stock': '#2196F3', 'Bond': '#FF9800'})
+                fig_asset.update_traces(textposition='inside', textinfo='percent+label')
+                fig_asset.update_layout(margin=dict(t=0, b=0, l=0, r=0), showlegend=False)
+                st.plotly_chart(fig_asset, use_container_width=True)
+            else: st.info("無資料")
+
+        with col_chart2:
+            st.subheader("持股佔比 (個股)")
+            fig_donut = px.pie(df_portfolio, values='市值(TWD)', names='代號', hole=0.4,
+                color_discrete_sequence=px.colors.qualitative.Set3)
+            fig_donut.update_traces(textposition='inside', textinfo='percent')
+            fig_donut.update_layout(margin=dict(t=0, b=0, l=0, r=0), showlegend=True)
+            st.plotly_chart(fig_donut, use_container_width=True)
+
+        with col_chart3:
+            st.subheader("股息貢獻主力 (年預估)")
+            df_bar = df_portfolio[df_portfolio['預估年息(TWD)'] > 0].sort_values(by='預估年息(TWD)', ascending=True)
+            if not df_bar.empty:
+                fig_bar = px.bar(df_bar, x='預估年息(TWD)', y='代號', orientation='h', text='預估年息(TWD)',
+                    color='預估年息(TWD)', color_continuous_scale='Tealgrn')
+                fig_bar.update_traces(texttemplate='$%{text:,.0f}', textposition='outside', cliponaxis=False)
+                fig_bar.update_layout(xaxis_title="", yaxis_title="", coloraxis_showscale=False,
+                    margin=dict(t=20, b=20, l=0, r=100), xaxis=dict(showticklabels=False))
+                st.plotly_chart(fig_bar, use_container_width=True)
+            else: st.info("尚無配息資料")
         
-        # 計算每一筆的總成本 (換算回台幣)
-        df['total_cost_twd'] = df.apply(
-            lambda x: (x['amount'] * x['price']) * (usdtwd_rate if x['currency'] == 'USD' else 1),
-            axis=1
-        )
-
-        # 計算關鍵指標
-        # 總投入 = 所有「買入」類別的總成本加總
-        total_invested = df[df['type'] == 'Buy']['total_cost_twd'].sum()
-        
-        # 取得所有持股的現價
-        unique_tickers = df['ticker'].unique().tolist()
-        current_prices = get_current_prices(unique_tickers)
-
-        # 計算目前市值
-        def calculate_current_value(row):
-            ticker = row['ticker']
-            price = current_prices.get(ticker)
-            
-            # 如果抓不到價格或價格是空值，就無法計算市值
-            if price is None or pd.isna(price):
-                return None 
-
-            try:
-                # 強制轉型為 float 進行計算，避免型別錯誤
-                amount_val = float(row['amount'])
-                price_val = float(price)
-                market_value_original = amount_val * price_val
-                
-                # 轉換回台幣
-                return market_value_original * (usdtwd_rate if row['currency'] == 'USD' else 1)
-            except Exception:
-                # 如果計算過程出錯 (例如資料有問題)，回傳 None
-                return None
-
-        df['current_value_twd'] = df.apply(calculate_current_value, axis=1)
-        
-        # 總市值 = 所有成功計算出市值的加總
-        total_market_value = df['current_value_twd'].sum()
-
-        # 計算損益
-        unrealized_pl = total_market_value - total_invested
-        pl_percentage = (unrealized_pl / total_invested * 100) if total_invested > 0 else 0
-
-        # 4. 顯示關鍵指標 (Metrics)
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("💰 總投入成本 (TWD)", f"${total_invested:,.0f}")
-        col_m2.metric("📈 目前總市值 (TWD)", f"${total_market_value:,.0f}", 
-                      delta=f"${unrealized_pl:,.0f} ({pl_percentage:+.1f}%)")
-        # col_m3 可以放其他指標，例如現金餘額或今年股息
-
         st.divider()
 
-        # 5. 顯示圖表與詳細記錄
-        tab_chart, tab_data = st.tabs(["📊 資產分布", "📝 交易紀錄明細"])
-
-        with tab_chart:
-            # 簡單的資產圓餅圖
-            if total_market_value > 0:
-                # 這裡只是一個簡單的範例，用 ticker 來分類
-                # 實際應用可能需要更複雜的邏輯來計算每個資產的現值
-                fig = px.pie(df, names='asset_type', title='資產類別分布 (以交易筆數計算)')
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                 st.info("尚未有足夠資料顯示圖表。")
-
-        with tab_data:
-            # 整理要顯示的欄位，讓表格更好看
-            display_df = df[['date', 'ticker', 'type', 'amount', 'price', 'currency', 'asset_type', 'notes']].copy()
-            # 格式化日期
-            display_df['date'] = pd.to_datetime(display_df['date']).dt.strftime('%Y-%m-%d')
-            
-            st.dataframe(
-                display_df.style.format({
-                    'amount': '{:,.4f}', 
-                    'price': '{:,.2f}'
-                }),
-                use_container_width=True,
-                hide_index=True,
-                 column_config={
-                    "date": "日期",
-                    "ticker": "代號",
-                    "type": "類別",
-                    "amount": "數量",
-                    "price": "單價",
-                    "currency": "幣別",
-                    "asset_type": "資產",
-                    "notes": "備註"
-                }
-            )
+    # ==========================================
+    # 📊 資產庫明細
+    # ==========================================
+    st.subheader("🗃️ 資產庫明細")
+    if not df_portfolio.empty:
+        st.dataframe(
+            df_portfolio.style.format({
+                "股數": "{:,.2f}",
+                "市值(TWD)": "${:,.0f}",
+                "未實現損益": "${:+,.0f}",
+                "報酬率%": "{:+.2%}",
+                "成本殖利率(YoC)%": "{:.2%}",
+                "預估年息(TWD)": "${:,.0f}",
+            })
+            .applymap(lambda v: 'color: #ff4b4b;' if v < 0 else 'color: #00c853;' if v > 0 else None, subset=["未實現損益", "報酬率%"]),
+            use_container_width=True, hide_index=True, height=300
+        )
